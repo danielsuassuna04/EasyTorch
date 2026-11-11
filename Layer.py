@@ -2,6 +2,23 @@ import torch
 from torch import nn
 
 
+class MaxPool2D(nn.Module):
+    def __init__(self,kernel_size: int = 3):
+        super().__init__()
+        self.mx = None
+        self.kernel_size = kernel_size
+
+    def build_layer(self, x):
+        self.mx = nn.MaxPool2d(self.kernel_size).to(x.device)
+        return self.mx(x)
+
+    def forward(self, X):
+        return self.mx(X)
+
+import torch
+from torch import nn
+
+
 class Dense(nn.Module):
     def __init__(self, neurons: int = 10, activation = "relu"):
         super().__init__()
@@ -68,6 +85,21 @@ class BatchNorm2d(nn.Module):
     def forward(self, X):
         return self.bn(X)
     
+class ReLU(nn.Module):
+    def forward(self, X):
+        return torch.relu(X)
+
+
+class GlobalAvgPool2d(nn.Module):
+    def forward(self, X):
+        return X.mean(dim=(2, 3))          # (N, C, H, W) -> (N, C)
+
+
+class Flatten(nn.Module):
+    def forward(self, X):
+        return X.flatten(1)
+
+
 class ResidualBlock(nn.Module):
     def __init__(self, out_channels, stride=1):
         super().__init__()
@@ -80,12 +112,11 @@ class ResidualBlock(nn.Module):
         self.bn2 = BatchNorm2d()
         self.shortcut_conv = None
         self.shortcut_bn = None
-        self.relu = nn.ReLU()
 
     def build_layer(self, x):
         in_channels = x.shape[1]
-        out = self.bn1.build_layer(self.conv1.build_layer(x))
-        out = self.relu(out)
+
+        out = torch.relu(self.bn1.build_layer(self.conv1.build_layer(x)))
         out = self.bn2.build_layer(self.conv2.build_layer(out))
         if self.stride != 1 or in_channels != self.out_channels:
             self.shortcut_conv = Conv2d(self.out_channels, 1, stride=self.stride, activation="linear")
@@ -94,14 +125,14 @@ class ResidualBlock(nn.Module):
         else:
             identity = x
 
-        return self.relu(out + identity)
+        return torch.relu(out + identity)
 
     def forward(self, X):
-        out = self.relu(self.bn1(self.conv1(X)))
+        out = torch.relu(self.bn1(self.conv1(X)))
         out = self.bn2(self.conv2(out))
 
         identity = X
         if self.shortcut_conv is not None:
             identity = self.shortcut_bn(self.shortcut_conv(X))
 
-        return self.relu(out + identity)
+        return torch.relu(out + identity)

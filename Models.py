@@ -1,29 +1,179 @@
-from torch import nn
 import torch
+from torch import nn
+from torch.utils.data import TensorDataset, DataLoader
+from tqdm.auto import tqdm
 import Layer
 
 
-class Model(nn.Module):
+# ---------------------------------------------------------------- device
+_DEFAULT_DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
+
+def device(name: str | None = None) -> torch.device:
+    """device() devolve o padrão; device("cuda") ou device("cpu") altera o padrão global."""
+    global _DEFAULT_DEVICE
+    if name is not None:
+        _DEFAULT_DEVICE = torch.device(name)
+    return _DEFAULT_DEVICE
+
+
+# ---------------------------------------------------------------- camada
+class Softmax(nn.Module):
+    def forward(self, X):
+        return torch.softmax(X, dim=1)
+
+
+# ---------------------------------------------------------------- Model
+class Model(nn.Module):
     def __init__(self):
         super().__init__()
+        self.batch_size = 32
+        self.loss_func = None
+        self.optimizer = None
+        self._opt_cfg = None
+        self._ready = False
+        self.device = device()
 
-    def compile(self,optimizer = "Adam", loss = "mse", lr: float = 0.05):
+    # ---------- configuração ----------
+    def compile(self, optimizer="adam", loss="crossentropy", lr: float = 1e-3, batch_size: int = 32):
+        self.batch_size = batch_size
 
+        loss = loss.lower()
         if loss == "mse":
-            self.loss = nn.L1Loss()
+            self.loss_func = nn.MSELoss()
         elif loss == "crossentropy":
-            self.loss = nn.CrossEntropyLoss()
+            self.loss_func = nn.CrossEntropyLoss()
         else:
             raise ValueError("Valor não suportado para loss")
 
-        if optimizer == "Adam":
-            self.optimizer = torch.optmim.Adam(self.parameters(), lr = lr)
+        optimizer = optimizer.lower()
+        if optimizer not in ("adam", "sgd"):
+            raise ValueError("Otimizador não suportado")
+
+        self._opt_cfg = (optimizer, lr)
+        self.optimizer = None
+        self._ready = False
+
+    def _make_optimizer(self):
+        name, lr = self._opt_cfg
+        opt_cls = torch.optim.Adam if name == "adam" else torch.optim.SGD
+        return opt_cls(self.parameters(), lr=lr)
+
+    def set_device(self, dev: str):
+        self.device = torch.device(dev)
+        if self._ready:
+            self.to(self.device)
+            self.optimizer = self._make_optimizer()   # estado do otimizador ficou no device antigo
+        return self
+
+    def _prepare(self, sample_inputs):
+        """Constrói camadas lazy, move para o device e cria o otimizador."""
+        if self._ready:
+            return
+        self.eval()
+        with torch.no_grad():
+            self(sample_inputs[:1])
+
+        self.to(self.device)
+        self.optimizer = self._make_optimizer()
+        self._ready = True
+
+    # ---------- forward para a loss ----------
+    def _forward_logits(self, X):
+        """Saída usada na loss. Modelos sem Softmax final usam o forward normal."""
+        return self(X)
+
+    # ---------- utilitários ----------
+    def _to_loader(self, data, shuffle):
+        if data is None:
+            return None
+        if isinstance(data, DataLoader):
+            return data
+        if isinstance(data, (tuple, list)) and len(data) == 2:
+            X, y = data
+            return DataLoader(TensorDataset(X, y), batch_size=self.batch_size, shuffle=shuffle)
+        raise TypeError("Passe um DataLoader ou uma tupla (X, y)")
+
+    def _compute_metrics(self, preds, targets, metrics):
+        out = {}
+        for m in metrics:
+            m = m.lower()
+            if m == "accuracy":
+                pred_labels = preds.argmax(dim=1)
+                true_labels = targets.argmax(dim=1) if targets.ndim > 1 and targets.size(1) > 1 else targets
+                out["Acurácia"] = f"{(pred_labels == true_labels).float().mean().item() * 100:.2f}%"
+            elif m == "mae":
+                out["MAE"] = f"{torch.mean(torch.abs(preds - targets)).item():.4f}"
+            elif m == "mse":
+                out["MSE"] = f"{torch.mean((preds - targets) ** 2).item():.4f}"
+            else:
+                raise ValueError(f"Métrica não suportada: {m}")
+        return out
+
+    # ---------- treino ----------
+    def train_step(self, train_loader, test_loader, epoch, epochs, metrics):
+        self.train()
+        epoch_loss = 0.0
+        bar = tqdm(train_loader, desc=f"Época {epoch+1}/{epochs}", unit="batch")
+
+        for inputs, targets in bar:
+            inputs, targets = inputs.to(self.device), targets.to(self.device)
+            loss = self.loss_func(self._forward_logits(inputs), targets)
+
+            self.optimizer.zero_grad()
+            loss.backward()
+            self.optimizer.step()
+
+            epoch_loss += loss.item()
+            bar.set_postfix(loss=f"{loss.item():.4f}")
+
+        self.eval()
+        parts = [f"Loss treino: {epoch_loss / len(train_loader):.4f}"]
+
+        if test_loader is not None:
+            all_preds, all_targets, val_loss, n = [], [], 0.0, 0
+            with torch.inference_mode():
+                for inputs, targets in test_loader:
+                    inputs, targets = inputs.to(self.device), targets.to(self.device)
+                    outputs = self._forward_logits(inputs)
+                    val_loss += self.loss_func(outputs, targets).item() * targets.size(0)
+                    n += targets.size(0)
+                    all_preds.append(outputs)
+                    all_targets.append(targets)
+
+            preds, tgts = torch.cat(all_preds), torch.cat(all_targets)
+            parts.append(f"Loss val: {val_loss / max(n, 1):.4f}")
+            parts += [f"{k}: {v}" for k, v in self._compute_metrics(preds, tgts, metrics).items()]
+
+        print(f"Fim da Época {epoch+1}/{epochs} | " + " | ".join(parts))
+
+    def fit(self, train, test=None, epochs: int = 10, metrics: list = None):
+        if self.loss_func is None:
+            raise RuntimeError("Chame compile() antes de fit().")
+        metrics = metrics or []
+
+        train_loader = self._to_loader(train, shuffle=True)
+        test_loader = self._to_loader(test, shuffle=False)
+
+        sample_inputs, _ = next(iter(train_loader))
+        self._prepare(sample_inputs)
+
+        for epoch in range(epochs):
+            self.train_step(train_loader, test_loader, epoch, epochs, metrics)
+
+    # ---------- inferência ----------
+    @torch.inference_mode()
+    def predict(self, X, batch_size: int | None = None):
+        """Devolve a saída completa do modelo (com Softmax, se houver), na CPU."""
+        self.eval()
+        batch_size = batch_size or self.batch_size
+        outs = [self(X[i:i + batch_size].to(self.device)).cpu()
+                for i in range(0, len(X), batch_size)]
+        return torch.cat(outs)
 
 
-    def train(self,X: torch.Tensor, epochs:int):
-        return 
-class Sequential(nn.Module):
+# ---------------------------------------------------------------- Sequential
+class Sequential(Model):
     def __init__(self):
         super().__init__()
         self.layers = nn.ModuleList()
@@ -35,45 +185,51 @@ class Sequential(nn.Module):
     def build(self, input_shape):
         if self._built:
             return
-        x = torch.zeros(1, *input_shape)
-        
-        for layer in self.layers:
-            if hasattr(layer, 'build_layer'):
-                x = layer.build_layer(x)
-            else:
-                x = layer(x)
-                
+        was_training = self.training
+        self.eval()
+        with torch.no_grad():
+            x = torch.zeros(1, *input_shape)
+            for layer in self.layers:
+                x = layer.build_layer(x) if hasattr(layer, "build_layer") else layer(x)
+        self.train(was_training)
         self._built = True
 
-    def forward(self, X: torch.Tensor) -> torch.Tensor:
+    def _run(self, X, skip_final_softmax: bool):
         if not self._built:
             self.build(X.shape[1:])
-        
-        for layer in self.layers:
+
+        layers = self.layers
+        if skip_final_softmax and len(layers) > 0 and isinstance(layers[-1], Softmax):
+            layers = layers[:-1]
+        for layer in layers:
             X = layer(X)
         return X
-    
-class ResNet(Sequential):
-    def __init__(self, blocks_per_stage=(2, 2, 2, 2), num_classes=1000,
-                 channels=(64, 128, 256, 512)):
-        super().__init__()
-        self.add(Layer.Conv2d(channels[0], 7, stride=2, padding=3, activation="linear"))
-        self.add(Layer.BatchNorm2d())
-        self.add(nn.ReLU())
-        self.add(nn.MaxPool2d(3, stride=2, padding=1))
 
-        # estágios residuais
+    def forward(self, X: torch.Tensor) -> torch.Tensor:
+        return self._run(X, skip_final_softmax=False)
+
+    def _forward_logits(self, X):
+        return self._run(X, skip_final_softmax=True)
+
+
+# ---------------------------------------------------------------- ResNet
+class ResNet(Sequential):
+    def __init__(self, blocks_per_stage=(2, 2, 2, 2), num_classes=10,
+                 channels=(32, 64, 128, 256), softmax: bool = True):
+        super().__init__()
+
+        # stem para imagens pequenas (28x28): sem stride e sem maxpool
+        self.add(Layer.Conv2d(channels[0], 3, stride=1, padding=1, activation="linear"))
+        self.add(Layer.BatchNorm2d())
+        self.add(Layer.ReLU())
+
         for i, (n_blocks, ch) in enumerate(zip(blocks_per_stage, channels)):
             for j in range(n_blocks):
-                stride = 2 if (j == 0 and i > 0) else 1  # reduz resolução no 1º bloco de cada estágio (exceto o primeiro)
+                stride = 2 if (j == 0 and i > 0) else 1
                 self.add(Layer.ResidualBlock(ch, stride=stride))
 
-        # cabeça
-        self.add(nn.AdaptiveAvgPool2d((1, 1)))
-        self.add(nn.Flatten())
+        self.add(Layer.GlobalAvgPool2d())
+        self.add(Layer.Flatten())
         self.add(Layer.Dense(num_classes, activation="linear"))
-
-
-
-
-    
+        if softmax:
+            self.add(Softmax())
