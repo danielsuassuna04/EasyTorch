@@ -3,6 +3,26 @@ import torch
 import Layer
 
 
+class Model(nn.Module):
+
+    def __init__(self):
+        super().__init__()
+
+    def compile(self,optimizer = "Adam", loss = "mse", lr: float = 0.05):
+
+        if loss == "mse":
+            self.loss = nn.L1Loss()
+        elif loss == "crossentropy":
+            self.loss = nn.CrossEntropyLoss()
+        else:
+            raise ValueError("Valor não suportado para loss")
+
+        if optimizer == "Adam":
+            self.optimizer = torch.optmim.Adam(self.parameters(), lr = lr)
+
+
+    def train(self,X: torch.Tensor, epochs:int):
+        return 
 class Sequential(nn.Module):
     def __init__(self):
         super().__init__()
@@ -37,8 +57,6 @@ class ResNet(Sequential):
     def __init__(self, blocks_per_stage=(2, 2, 2, 2), num_classes=1000,
                  channels=(64, 128, 256, 512)):
         super().__init__()
-
-        # stem
         self.add(Layer.Conv2d(channels[0], 7, stride=2, padding=3, activation="linear"))
         self.add(Layer.BatchNorm2d())
         self.add(nn.ReLU())

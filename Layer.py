@@ -78,19 +78,15 @@ class ResidualBlock(nn.Module):
         self.bn1 = BatchNorm2d()
         self.conv2 = Conv2d(out_channels, 3, stride=1, padding=1, activation="linear")
         self.bn2 = BatchNorm2d()
-        self.shortcut_conv = None   # só existe se precisar de projeção
+        self.shortcut_conv = None
         self.shortcut_bn = None
         self.relu = nn.ReLU()
 
     def build_layer(self, x):
         in_channels = x.shape[1]
-
-        # caminho principal
         out = self.bn1.build_layer(self.conv1.build_layer(x))
         out = self.relu(out)
         out = self.bn2.build_layer(self.conv2.build_layer(out))
-
-        # atalho: projeção 1x1 se mudar resolução ou nº de canais
         if self.stride != 1 or in_channels != self.out_channels:
             self.shortcut_conv = Conv2d(self.out_channels, 1, stride=self.stride, activation="linear")
             self.shortcut_bn = BatchNorm2d()
