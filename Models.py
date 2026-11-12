@@ -35,35 +35,48 @@ class Model(nn.Module):
         self.device = device()
 
     # ---------- configuração ----------
-    def compile(self, optimizer="adam", loss="crossentropy", lr: float = 1e-3, batch_size: int = 32):
+    def compile(self, optimizer="adam", loss="crossentropy", lr=1e-3, batch_size=32,
+            weight_decay=0.0, label_smoothing=0.0, scheduler=None,
+            grad_clip=None, amp=False):
         self.batch_size = batch_size
 
         loss = loss.lower()
         if loss == "mse":
             self.loss_func = nn.MSELoss()
         elif loss == "crossentropy":
-            self.loss_func = nn.CrossEntropyLoss()
+            self.loss_func = nn.CrossEntropyLoss(label_smoothing=label_smoothing)
         else:
             raise ValueError("Valor não suportado para loss")
 
         optimizer = optimizer.lower()
-        if optimizer not in ("adam", "sgd"):
+        if optimizer not in ("adam", "adamw", "sgd"):
             raise ValueError("Otimizador não suportado")
 
-        self._opt_cfg = (optimizer, lr)
+        self._opt_cfg = (optimizer, lr, weight_decay)
+        self._scheduler_name = scheduler
+        self._scheduler = None
+        self.grad_clip = grad_clip
+        self._amp = amp
         self.optimizer = None
         self._ready = False
 
     def _make_optimizer(self):
-        name, lr = self._opt_cfg
-        opt_cls = torch.optim.Adam if name == "adam" else torch.optim.SGD
-        return opt_cls(self.parameters(), lr=lr)
+        name, lr, wd = self._opt_cfg
+        decay, no_decay = [], []
+        for n, p in self.named_parameters():
+            (no_decay if p.ndim <= 1 or n.endswith(("cls", "pe")) else decay).append(p)
+        groups = [{"params": decay, "weight_decay": wd},
+                {"params": no_decay, "weight_decay": 0.0}]
+        opt_cls = {"adam": torch.optim.Adam, "adamw": torch.optim.AdamW, "sgd": torch.optim.SGD}[name]
+        return opt_cls(groups, lr=lr)
 
     def set_device(self, dev: str):
         self.device = torch.device(dev)
         if self._ready:
             self.to(self.device)
-            self.optimizer = self._make_optimizer()   # estado do otimizador ficou no device antigo
+            self.optimizer = self._make_optimizer()
+            self._scaler = torch.amp.GradScaler(enabled=self._amp and self.device.type == "cuda")
+            self._ready = True   # estado do otimizador ficou no device antigo
         return self
 
     def _prepare(self, sample_inputs):
@@ -115,41 +128,54 @@ class Model(nn.Module):
     # ---------- treino ----------
     def train_step(self, train_loader, test_loader, epoch, epochs, metrics):
         self.train()
+        use_amp = self._amp and self.device.type == "cuda"
         epoch_loss = 0.0
         bar = tqdm(train_loader, desc=f"Época {epoch+1}/{epochs}", unit="batch")
 
         for inputs, targets in bar:
             inputs, targets = inputs.to(self.device), targets.to(self.device)
-            loss = self.loss_func(self._forward_logits(inputs), targets)
+            self.optimizer.zero_grad(set_to_none=True)
+            with torch.autocast(device_type=self.device.type, dtype=torch.float16, enabled=use_amp):
+                loss = self.loss_func(self._forward_logits(inputs), targets)
 
-            self.optimizer.zero_grad()
-            loss.backward()
-            self.optimizer.step()
+            self._scaler.scale(loss).backward()
+            if self.grad_clip:
+                self._scaler.unscale_(self.optimizer)
+                nn.utils.clip_grad_norm_(self.parameters(), self.grad_clip)
+            self._scaler.step(self.optimizer)
+            self._scaler.update()
+            if self._scheduler is not None:
+                self._scheduler.step()
 
             epoch_loss += loss.item()
             bar.set_postfix(loss=f"{loss.item():.4f}")
 
         self.eval()
-        parts = [f"Loss treino: {epoch_loss / len(train_loader):.4f}"]
+        train_loss = epoch_loss / len(train_loader)
+        parts = [f"Loss treino: {train_loss:.4f}"]
+        monitored = train_loss
 
         if test_loader is not None:
             all_preds, all_targets, val_loss, n = [], [], 0.0, 0
             with torch.inference_mode():
                 for inputs, targets in test_loader:
                     inputs, targets = inputs.to(self.device), targets.to(self.device)
-                    outputs = self._forward_logits(inputs)
-                    val_loss += self.loss_func(outputs, targets).item() * targets.size(0)
+                    with torch.autocast(device_type=self.device.type, dtype=torch.float16, enabled=use_amp):
+                        outputs = self._forward_logits(inputs)
+                        val_loss += self.loss_func(outputs, targets).item() * targets.size(0)
                     n += targets.size(0)
-                    all_preds.append(outputs)
+                    all_preds.append(outputs.float())
                     all_targets.append(targets)
 
             preds, tgts = torch.cat(all_preds), torch.cat(all_targets)
-            parts.append(f"Loss val: {val_loss / max(n, 1):.4f}")
+            monitored = val_loss / max(n, 1)
+            parts.append(f"Loss val: {monitored:.4f}")
             parts += [f"{k}: {v}" for k, v in self._compute_metrics(preds, tgts, metrics).items()]
 
         print(f"Fim da Época {epoch+1}/{epochs} | " + " | ".join(parts))
+        return monitored
 
-    def fit(self, train, test=None, epochs: int = 10, metrics: list = None):
+    def fit(self, train, test=None, epochs=10, metrics=None, save_best: str | None = None):
         if self.loss_func is None:
             raise RuntimeError("Chame compile() antes de fit().")
         metrics = metrics or []
@@ -160,8 +186,17 @@ class Model(nn.Module):
         sample_inputs, _ = next(iter(train_loader))
         self._prepare(sample_inputs)
 
+        if self._scheduler_name == "onecycle":
+            self._scheduler = torch.optim.lr_scheduler.OneCycleLR(
+                self.optimizer, max_lr=self._opt_cfg[1],
+                total_steps=epochs * len(train_loader), pct_start=0.1)
+
+        best = float("inf")
         for epoch in range(epochs):
-            self.train_step(train_loader, test_loader, epoch, epochs, metrics)
+            monitored = self.train_step(train_loader, test_loader, epoch, epochs, metrics)
+            if save_best and monitored < best:
+                best = monitored
+                torch.save(self.state_dict(), save_best)
 
     # ---------- inferência ----------
     @torch.inference_mode()
@@ -201,7 +236,7 @@ class Sequential(Model):
             self.build(X.shape[1:])
 
         layers = self.layers
-        if skip_final_softmax and len(layers) > 0 and isinstance(layers[-1], Softmax):
+        if skip_final_softmax and len(layers) > 0 and isinstance(layers[-1], Layer.Softmax):
             layers = layers[:-1]
         for layer in layers:
             X = layer(X)
@@ -234,4 +269,57 @@ class ResNet(Sequential):
         self.add(Layer.Flatten())
         self.add(Layer.Dense(num_classes, activation="linear"))
         if softmax:
-            self.add(Softmax())
+            self.add(Layer.Softmax())
+            
+class VisionTransformer(Sequential):
+    def __init__(self, patch_size=4, embed_dim=64, depth=4, num_heads=4,
+                 mlp_dim=128, num_classes=10, dropout=0.1, softmax: bool = True):
+        super().__init__()
+
+        # (N, C, H, W) -> (N, L, E)
+        self.add(Layer.PatchEmbedding(embed_dim, patch_size))
+        self.add(Layer.ClassToken())
+        self.add(Layer.PositionalEncoding())
+        self.add(Layer.Dropout(dropout))
+
+        for _ in range(depth):
+            self.add(Layer.TransformerEncoderBlock(num_heads, mlp_dim, dropout))
+
+        self.add(Layer.LayerNorm())
+        self.add(Layer.TakeClassToken())               # (N, L, E) -> (N, E)
+        self.add(Layer.Dense(num_classes, activation="linear"))
+        if softmax:
+            self.add(Layer.Softmax())
+            
+class CNNViT(Sequential):
+    def __init__(self, channels=(32, 64, 128), blocks_per_stage=(1, 1, 1),
+                 embed_dim=64, depth=4, num_heads=4, mlp_dim=128,
+                 num_classes=10, dropout=0.1, softmax: bool = True):
+        super().__init__()
+
+        # stem para imagens pequenas (28x28)
+        self.add(Layer.Conv2d(channels[0], 3, stride=1, padding=1, activation="linear"))
+        self.add(Layer.BatchNorm2d())
+        self.add(Layer.ReLU())
+
+        # backbone CNN: cada estágio (exceto o primeiro) reduz a resolução pela metade
+        # 28x28 -> 28x28 -> 14x14 -> 7x7
+        for i, (n_blocks, ch) in enumerate(zip(blocks_per_stage, channels)):
+            for j in range(n_blocks):
+                stride = 2 if (j == 0 and i > 0) else 1
+                self.add(Layer.ResidualBlock(ch, stride=stride))
+
+        # cada posição do mapa de features vira um token (7x7 = 49 tokens)
+        self.add(Layer.PatchEmbedding(embed_dim, patch_size=1))
+        self.add(Layer.ClassToken())
+        self.add(Layer.PositionalEncoding())
+        self.add(Layer.Dropout(dropout))
+
+        for _ in range(depth):
+            self.add(Layer.TransformerEncoderBlock(num_heads, mlp_dim, dropout))
+
+        self.add(Layer.LayerNorm())
+        self.add(Layer.TakeClassToken())
+        self.add(Layer.Dense(num_classes, activation="linear"))
+        if softmax:
+            self.add(Layer.Softmax())
