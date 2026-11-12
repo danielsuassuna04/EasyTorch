@@ -2,7 +2,8 @@ import torch
 from torch import nn
 
 def _activation(name: str) -> nn.Module:
-    return {"relu": nn.ReLU(), "tanh": nn.Tanh(), "sigmoid": nn.Sigmoid()}.get(name, nn.Identity())
+    return {"relu": nn.ReLU(), "gelu": nn.GELU(), "tanh": nn.Tanh(),
+            "sigmoid": nn.Sigmoid()}.get(name, nn.Identity())
 
 
 class Layer(nn.Module):
@@ -30,7 +31,14 @@ class Dense(Layer):
     def _build(self, x):
         self.layer = nn.Sequential(nn.Linear(x.shape[1], self.neurons), self.activation)
 
-
+class DenseTransformer(Layer):
+    def __init__(self, neurons: int = 10, activation="relu"):
+        super().__init__()
+        self.neurons = neurons
+        self.activation = _activation(activation)
+    def _build(self, x):
+        self.layer = nn.Sequential(nn.Linear(x.shape[-1], self.neurons), self.activation)
+        
 class Conv2d(Layer):
     def __init__(self, out_channels, kernel_size, stride=1, padding=0, activation="relu"):
         super().__init__()
@@ -115,3 +123,103 @@ class ResidualBlock(Layer):
             identity = self.shortcut_bn(self.shortcut_conv(X))
 
         self.layer = torch.relu(out + identity)
+
+class LearnedPositionalEncoding(nn.Module):
+    def __init__(self, seq_len: int, embed_dim: int):
+        super().__init__()
+        self.pe = nn.Parameter(torch.zeros(1, seq_len, embed_dim))
+        nn.init.trunc_normal_(self.pe, std=0.02)
+
+    def forward(self, x):                                             # x: (N, L, E)
+        return x + self.pe
+    
+class PositionalEncoding(Layer):
+    def _build(self, x):                                              # x: (N, L, E)
+        self.layer = LearnedPositionalEncoding(x.shape[1], x.shape[2])
+
+    def forward(self, X):
+        return self.layer(X)
+        
+class MultiHeadSelfAttention(Layer):
+    def __init__(self, num_heads, dropout=0.0):
+        super().__init__()
+        self.num_heads = num_heads
+        self.dropout = dropout
+
+    def _build(self, x):
+        self.layer = nn.MultiheadAttention(
+            embed_dim=x.shape[-1],
+            num_heads=self.num_heads,
+            dropout=self.dropout,
+            batch_first=True,
+        )
+
+    def forward(self, X):
+        out, _ = self.layer(X, X, X, need_weights=False)
+        return out
+
+class Dropout(Layer):
+    def __init__(self, p):
+        super().__init__()
+        self.p = p
+
+    def _build(self, x):
+        self.layer = nn.Dropout(self.p)
+
+class PatchEmbedding(Layer):
+    """(N, C, H, W) -> (N, L, E), com L = (H/p)*(W/p)"""
+    def __init__(self, embed_dim, patch_size):
+        super().__init__()
+        self.embed_dim = embed_dim
+        self.patch_size = patch_size
+
+    def _build(self, x):
+        self.layer = nn.Conv2d(x.shape[1], self.embed_dim,
+                               kernel_size=self.patch_size, stride=self.patch_size)
+
+    def forward(self, X):
+        return self.layer(X).flatten(2).transpose(1, 2)
+
+
+class ClassToken(Layer):
+    """Concatena um token [CLS] aprendível no início da sequência."""
+    def _build(self, x):
+        self.cls = nn.Parameter(torch.zeros(1, 1, x.shape[-1]))
+        nn.init.trunc_normal_(self.cls, std=0.02)
+
+    def forward(self, X):
+        return torch.cat([self.cls.expand(X.shape[0], -1, -1), X], dim=1)
+
+
+class TakeClassToken(Layer):
+    def forward(self, X):
+        return X[:, 0]                          # (N, L, E) -> (N, E)
+
+
+class LayerNorm(Layer):
+    def _build(self, x):
+        self.layer = nn.LayerNorm(x.shape[-1])
+        
+class TransformerEncoderBlock(Layer):
+    def __init__(self, num_heads, mlp_dim, dropout=0.0):
+        super().__init__()
+        self.mlp_dim = mlp_dim
+        self.ln1 = LayerNorm()
+        self.attn = MultiHeadSelfAttention(num_heads, dropout)
+        self.ln2 = LayerNorm()
+        self.fc1 = Dense(mlp_dim, "gelu")
+        self.fc2 = None                         # precisa do embed_dim, criado no build
+        self.drop = Dropout(dropout)
+
+    def _build(self, x):                        # x: (N, L, E)
+        h = self.attn.build_layer(self.ln1.build_layer(x))
+        x = x + self.drop.build_layer(h)
+
+        h = self.fc1.build_layer(self.ln2.build_layer(x))
+        self.fc2 = Dense(x.shape[-1], "linear")
+        self.fc2.build_layer(h)
+
+    def forward(self, X):
+        X = X + self.drop(self.attn(self.ln1(X)))
+        X = X + self.drop(self.fc2(self.fc1(self.ln2(X))))
+        return X
