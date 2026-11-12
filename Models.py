@@ -3,7 +3,7 @@ from torch import nn
 from torch.utils.data import TensorDataset, DataLoader
 from tqdm.auto import tqdm
 import Layer
-
+from DataTransform import Data
 
 # ---------------------------------------------------------------- device
 _DEFAULT_DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -87,12 +87,14 @@ class Model(nn.Module):
     def _to_loader(self, data, shuffle):
         if data is None:
             return None
+        if isinstance(data, Data):
+            return data.loader(batch_size=self.batch_size, shuffle=shuffle, augment=shuffle)
         if isinstance(data, DataLoader):
             return data
         if isinstance(data, (tuple, list)) and len(data) == 2:
             X, y = data
             return DataLoader(TensorDataset(X, y), batch_size=self.batch_size, shuffle=shuffle)
-        raise TypeError("Passe um DataLoader ou uma tupla (X, y)")
+        raise TypeError("Passe um Data, um DataLoader ou uma tupla (X, y)")
 
     def _compute_metrics(self, preds, targets, metrics):
         out = {}
